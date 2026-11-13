@@ -3557,7 +3557,9 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     UI_folder
       .add(guiControls, 'tool', {
         'Flashlight' : 'TOOL_NONE',
-        'Temperature' : 'TOOL_TEMPERATURE',
+        'Warm Air / Heat' : 'TOOL_TEMPERATURE',
+        'Cold Air / Cooling' : 'TOOL_COOLING',
+        'Eraser (Terrain / Water / Sky)' : 'TOOL_ERASER',
         'Water Vapor / Cloud' : 'TOOL_WATER',
         'Land' : 'TOOL_WALL_LAND',
         'Lake / Sea' : 'TOOL_WALL_SEA',
@@ -4604,7 +4606,13 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
         guiControls.wholeWidth = false; // flashlight can't be whole width
       }
     } else if (event.code == 'KeyQ') {
-      guiControls.tool = 'TOOL_TEMPERATURE';
+      if (event.shiftKey) {
+        guiControls.tool = 'TOOL_COOLING';
+      } else {
+        guiControls.tool = 'TOOL_TEMPERATURE';
+      }
+    } else if (event.code == 'KeyX') {
+      guiControls.tool = 'TOOL_ERASER';
     } else if (event.code == 'KeyW') {
       guiControls.tool = 'TOOL_WATER';
     } else if (event.code == 'KeyE') {
@@ -5794,6 +5802,10 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
           inputType = 0; // only flashlight on
         else if (guiControls.tool == 'TOOL_TEMPERATURE')
           inputType = 1;
+        else if (guiControls.tool == 'TOOL_COOLING')
+          inputType = 1;
+        else if (guiControls.tool == 'TOOL_ERASER')
+          inputType = 9;
         else if (guiControls.tool == 'TOOL_WATER')
           inputType = 2;
         else if (guiControls.tool == 'TOOL_SMOKE')
@@ -5824,6 +5836,10 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
           inputType = 22;
 
         var intensity = guiControls.brushIntensity;
+
+        if (guiControls.tool == 'TOOL_COOLING') {
+          intensity = -Math.abs(intensity);
+        }
 
         if (ctrlPressed) {
           intensity *= -1;

@@ -54,6 +54,85 @@ layout(location = 2) out ivec4 wall;
 // #define wallManhattanInfluence 2 // 2 How many cells from the nearest wall effects like smoothing and drag are applied
 #define exchangeRate 0.015       // Rate of smoothing near surface
 
+// =========================================================================
+// HYDROSTATIC FLUID CONSTANTS & HELPERS (100% MASS CONSERVING)
+// =========================================================================
+const float MAX_MASS = 1.0;
+const float MAX_COMPRESS = 0.02;
+const float FLOW_RATE = 0.20;
+
+float getWaterMass(ivec4 w, vec4 wat)
+{
+  if (w[DISTANCE] != 0 || w[TYPE] != WALLTYPE_WATER)
+    return 0.0;
+  float m = wat[SOIL_MOISTURE];
+  // Tương thích ngược với preset/cọ vẽ cũ đặt SOIL_MOISTURE = 100.0 hoặc chưa khởi tạo
+  if (m > 20.0)
+    return MAX_MASS;
+  if (m <= 0.0)
+    return (wat[TOTAL] < 1000.0) ? MAX_MASS : 0.0;
+  return m;
+}
+
+bool isCellSolid(ivec4 w, vec2 tc)
+{
+  if (tc.y <= texelSize.y || tc.y >= 1.0 - texelSize.y)
+    return true;
+  return (w[DISTANCE] == 0 && w[TYPE] != WALLTYPE_WATER);
+}
+
+float getDesiredBottomMass(float totalMass)
+{
+  if (totalMass <= MAX_MASS) {
+    return totalMass;
+  } else if (totalMass < 2.0 * MAX_MASS + MAX_COMPRESS) {
+    return (MAX_MASS * MAX_MASS + totalMass * MAX_COMPRESS) / (MAX_MASS + MAX_COMPRESS);
+  } else {
+    return (totalMass + MAX_COMPRESS) * 0.5;
+  }
+}
+
+// 1. Luồng dọc đối xứng (> 0: chảy từ Trên xuống Dưới; < 0: áp suất đẩy ngược lên Trên)
+float calcVerticalFlux(float massTop, float massBottom, bool topIsSolid, bool bottomIsSolid)
+{
+  if (topIsSolid || bottomIsSolid)
+    return 0.0;
+  float totalMass = massTop + massBottom;
+  if (totalMass <= 0.0)
+    return 0.0;
+
+  // Khi tổng <= MAX_MASS: rơi tự do dứt điểm 100% xuống dưới (không để lại đuôi lơ lửng)
+  if (totalMass <= MAX_MASS) {
+    return massTop;
+  }
+
+  float desiredBottom = getDesiredBottomMass(totalMass);
+  float diff = desiredBottom - massBottom;
+
+  if (diff > 0.0) {
+    return min(diff, massTop) * 0.80;
+  } else if (diff < 0.0) {
+    return max(diff, -massBottom) * 0.15;
+  }
+  return 0.0;
+}
+
+// 2. Luồng ngang đối xứng có Free-fall Cohesion:
+// Chỉ cho phép chảy từ ô có mực nước cao hơn sang ô thấp hơn nếu ô nguồn đã có nền đỡ bên dưới
+float calcHorizontalFlux(float massLeft, float massRight, bool leftIsSolid, bool rightIsSolid, bool leftSupported, bool rightSupported)
+{
+  if (leftIsSolid || rightIsSolid)
+    return 0.0;
+  float diff = massLeft - massRight;
+  if (abs(diff) < 0.00001)
+    return 0.0;
+  if (diff > 0.0 && !leftSupported)
+    return 0.0;
+  if (diff < 0.0 && !rightSupported)
+    return 0.0;
+  return diff * FLOW_RATE;
+}
+
 void exchangeWith(vec2 texCoord) // exchange temperature and water
 {
   // base[TEMPERATURE] -= (base[TEMPERATURE] - texture(baseTex, texCoord)[TEMPERATURE]) * exchangeRate;
@@ -77,14 +156,94 @@ void main()
 
   vec4 precipFeedback = texture(precipFeedbackTex, texCoord);
 
-
-  float realTemp = potentialToRealT(base[TEMPERATURE]);
-
   wall = texture(wallTex, texCoord);
   ivec4 wallXmY0 = texture(wallTex, texCoordXmY0);
   ivec4 wallX0Ym = texture(wallTex, texCoordX0Ym);
   ivec4 wallXpY0 = texture(wallTex, texCoordXpY0);
   ivec4 wallX0Yp = texture(wallTex, texCoordX0Yp);
+
+  vec4 waterXmY0 = texture(waterTex, texCoordXmY0);
+  vec4 waterX0Ym = texture(waterTex, texCoordX0Ym);
+  vec4 waterXpY0 = texture(waterTex, texCoordXpY0);
+  vec4 waterX0Yp = texture(waterTex, texCoordX0Yp);
+
+  // Sample thêm 2 ô chéo dưới để kiểm tra Free-fall Cohesion đối xứng cho Left & Right
+  vec2 texCoordXmYm = texCoord + vec2(-texelSize.x, -texelSize.y);
+  vec2 texCoordXpYm = texCoord + vec2(texelSize.x, -texelSize.y);
+  ivec4 wallXmYm = texture(wallTex, texCoordXmYm);
+  ivec4 wallXpYm = texture(wallTex, texCoordXpYm);
+  vec4 waterXmYm = texture(waterTex, texCoordXmYm);
+  vec4 waterXpYm = texture(waterTex, texCoordXpYm);
+
+  // =========================================================================
+  // WATER FLUID DYNAMICS (FLUX-BASED, NO MIN_MASS DELETION)
+  // =========================================================================
+  bool isSolidThis  = isCellSolid(wall, texCoord);
+  bool isSolidUp    = isCellSolid(wallX0Yp, texCoordX0Yp);
+  bool isSolidDown  = isCellSolid(wallX0Ym, texCoordX0Ym);
+  bool isSolidLeft  = isCellSolid(wallXmY0, texCoordXmY0);
+  bool isSolidRight = isCellSolid(wallXpY0, texCoordXpY0);
+
+  float massThis      = getWaterMass(wall, water);
+  float massUp        = getWaterMass(wallX0Yp, waterX0Yp);
+  float massDown      = getWaterMass(wallX0Ym, waterX0Ym);
+  float massLeft      = getWaterMass(wallXmY0, waterXmY0);
+  float massRight     = getWaterMass(wallXpY0, waterXpY0);
+  float massLeftDown  = getWaterMass(wallXmYm, waterXmYm);
+  float massRightDown = getWaterMass(wallXpYm, waterXpYm);
+
+  bool supportedThis  = isSolidDown || (massDown >= MAX_MASS);
+  bool supportedLeft  = isCellSolid(wallXmYm, texCoordXmYm) || (massLeftDown >= MAX_MASS);
+  bool supportedRight = isCellSolid(wallXpYm, texCoordXpYm) || (massRightDown >= MAX_MASS);
+
+  float fluxDown  = calcVerticalFlux(massThis, massDown, isSolidThis, isSolidDown);
+  float fluxUp    = calcVerticalFlux(massUp, massThis, isSolidUp, isSolidThis);
+  float fluxRight = calcHorizontalFlux(massThis, massRight, isSolidThis, isSolidRight, supportedThis, supportedRight);
+  float fluxLeft  = calcHorizontalFlux(massLeft, massThis, isSolidLeft, isSolidThis, supportedLeft, supportedThis);
+
+  float newMass = max(massThis - fluxDown + fluxUp - fluxRight + fluxLeft, 0.0);
+  bool waterActiveFlow = (abs(fluxDown) + abs(fluxUp) + abs(fluxRight) + abs(fluxLeft)) > 0.0;
+
+  if (!isSolidThis) {
+    bool wasWater = (wall[DISTANCE] == 0 && wall[TYPE] == WALLTYPE_WATER);
+
+    if (newMass > 0.0) {
+      // Giữ nguyên mọi mass > 0.0 (tuyệt đối không xóa theo MIN_MASS)
+      float inFromUp    = max(fluxUp, 0.0);
+      float inFromDown  = max(-fluxDown, 0.0);
+      float inFromLeft  = max(fluxLeft, 0.0);
+      float inFromRight = max(-fluxRight, 0.0);
+      float outTotal    = max(fluxDown, 0.0) + max(-fluxUp, 0.0) + max(fluxRight, 0.0) + max(-fluxLeft, 0.0);
+      float retained    = max(massThis - outTotal, 0.0);
+      float totalWeight = retained + inFromUp + inFromDown + inFromLeft + inFromRight;
+
+      if (totalWeight > 0.0) {
+        float tempWeighted = retained * base[TEMPERATURE]
+          + inFromUp    * texture(baseTex, texCoordX0Yp)[TEMPERATURE]
+          + inFromDown  * texture(baseTex, texCoordX0Ym)[TEMPERATURE]
+          + inFromLeft  * texture(baseTex, texCoordXmY0)[TEMPERATURE]
+          + inFromRight * texture(baseTex, texCoordXpY0)[TEMPERATURE];
+        base[TEMPERATURE] = tempWeighted / totalWeight;
+      }
+
+      wall[DISTANCE] = 0;
+      wall[TYPE] = WALLTYPE_WATER;
+      wall[VEGETATION] = 20;
+      base[VX] = 0.0;
+      base[VY] = 0.0;
+      water = vec4(1002.0, 0.0, newMass, 0.0);
+    } else if (wasWater) {
+      // Chỉ trở thành không khí khi lượng nước về đúng 0.0
+      wall[DISTANCE] = 255;
+      wall[TYPE] = WALLTYPE_INERT;
+      base[VX] = 0.0;
+      base[VY] = 0.0;
+      base[TEMPERATURE] = getInitialT(int(fragCoord.y));
+      water = vec4(0.0);
+    }
+  }
+
+  float realTemp = potentialToRealT(base[TEMPERATURE]);
 
   vec4 light = texture(lightTex, texCoord);
 
@@ -157,7 +316,6 @@ void main()
       nextToWall = true;
       wall[DISTANCE] = 1;          // dist to nearest wall = 1
 
-      vec4 waterX0Ym = texture(waterTex, texCoordX0Ym);
       snowCover = waterX0Ym[SNOW];
       soilMoisture = waterX0Ym[SOIL_MOISTURE];
       wall[VERT_DISTANCE] = 1; // directly above ground
@@ -167,25 +325,19 @@ void main()
       nextToWall = true;
       wall[DISTANCE] = 1;                     // dist to nearest wall = 1
 
-      if (wallXmY0[TYPE] == WALLTYPE_WATER) { // if left is water, build a dyke
-        wall[TYPE] = WALLTYPE_LAND;
+      // Chỉ lấp khe 1 pixel đối với tường đất/cứng, không lấp khoảng không giữa nước
+      if (wallXpY0[DISTANCE] == 0 && wallXmY0[TYPE] != WALLTYPE_WATER && wallXpY0[TYPE] != WALLTYPE_WATER) {
         wall[DISTANCE] = 0;
+        if (wall[TYPE] == WALLTYPE_WATER || wall[TYPE] == WALLTYPE_INERT)
+          wall[TYPE] = wallXmY0[TYPE];
       }
-
-      if (wallXpY0[DISTANCE] == 0)            // left and right is wall, make this wall to fill narrow gaps
-        wall[DISTANCE] = 0;
     } else if (wallXpY0[DISTANCE] == 0) {     // right is wall
       nextToWall = true;
       wall[DISTANCE] = 1;                     // dist to nearest wall = 1
-
-      if (wallXpY0[TYPE] == WALLTYPE_WATER) { // if right is water, build a dyke
-        wall[TYPE] = WALLTYPE_LAND;
-        wall[DISTANCE] = 0;
-      }
     }
     if (wallX0Yp[DISTANCE] == 0) {                                                  // above is wall
       nextToWall = true;
-      if (texCoord.y < 0.99 && (!allowCaves || wallX0Yp[TYPE] == WALLTYPE_WATER)) { // Fill in land below
+      if (texCoord.y < 0.99 && (!allowCaves && wallX0Yp[TYPE] != WALLTYPE_WATER)) { // Fill in land below only if not water
         wall[TYPE] = WALLTYPE_LAND;
         wall[DISTANCE] = 0;                                                         //  set this to wall
       } else {
@@ -311,7 +463,7 @@ void main()
 
       // base[PRESSURE]  += 0.001; // add air pressure at the suface. makes air rise everywhere and creates huge cells
 
-      vec4 waterInSurface = texture(waterTex, texCoordX0Ym);
+      vec4 waterInSurface = waterX0Ym;
 
       switch (wall[TYPE]) {
       case WALLTYPE_FIRE:
@@ -370,24 +522,27 @@ void main()
     }
   } else {                                                                 // this is wall
 
-    wall[VERT_DISTANCE] = wallX0Yp[VERT_DISTANCE] - 1;                     // height below ground is counted
+    if (wallX0Yp[DISTANCE] != 0) {
+      wall[VERT_DISTANCE] = 0;                                             // surface layer when air is above
+    } else {
+      wall[VERT_DISTANCE] = min(wallX0Yp[VERT_DISTANCE] - 1, -1);          // height below ground is counted
+    }
 
     if (wall[VERT_DISTANCE] < 0) {                                         // below surface
-      water.ba = texture(waterTex, texCoordX0Yp).ba;                       // soil moisture and snow is copied from above
+      if (wall[TYPE] != WALLTYPE_WATER) {
+        water.ba = waterX0Yp.ba;                                           // soil moisture and snow is copied from above
+      }
       wall[VEGETATION] = wallX0Yp[VEGETATION];                             // vegetation is copied from above
 
       if (wallX0Yp[DISTANCE] == 0) {                                       // if above is wall
         if (wallX0Yp[TYPE] != WALLTYPE_WATER) {                            // above is not water
           wall[TYPE] = wallX0Yp[TYPE];                                     // copy walltype from above
-        } else if (wall[TYPE] == WALLTYPE_WATER) {                         // this is water
-                                                                           //   wall[TYPE] = wallX0Yp[TYPE];                                     // land can't be over water. copy walltype from above
+        } else if (wall[TYPE] == WALLTYPE_WATER && !waterActiveFlow) {     // this is static water
           base[TEMPERATURE] = texture(baseTex, texCoordX0Yp)[TEMPERATURE]; // copy water temperature from above
         }
       }
 
     } else if (wall[VERT_DISTANCE] == 0) { // at/in surface layer
-
-      vec4 waterX0Yp = texture(waterTex, texCoordX0Yp);
 
       vec2 precipDeposition = texture(precipDepositionTex, texCoord).xy;
 
@@ -416,7 +571,7 @@ void main()
 
 
         vec4 baseAboveSurface = texture(baseTex, texCoordX0Yp);
-        vec4 waterAboveSurface = texture(waterTex, texCoordX0Yp);
+        vec4 waterAboveSurface = waterX0Yp;
 
         float realTempAboveSurface = potentialToRealT(baseAboveSurface[TEMPERATURE], texCoordX0Yp.y);
 
@@ -436,13 +591,13 @@ void main()
           float totalNeighborSoilMoisture = 0.0;
 
           if (wallXmY0[VERT_DISTANCE] == 0 && (wallXmY0[TYPE] == WALLTYPE_LAND || wallXmY0[TYPE] == WALLTYPE_URBAN)) {
-            totalNeighborSnow += texture(waterTex, texCoordXmY0)[SNOW];
-            totalNeighborSoilMoisture += texture(waterTex, texCoordXmY0)[SOIL_MOISTURE];
+            totalNeighborSnow += waterXmY0[SNOW];
+            totalNeighborSoilMoisture += waterXmY0[SOIL_MOISTURE];
             numNeighbors += 1.;
           }
           if (wallXpY0[VERT_DISTANCE] == 0 && (wallXpY0[TYPE] == WALLTYPE_LAND || wallXpY0[TYPE] == WALLTYPE_URBAN)) {
-            totalNeighborSnow += texture(waterTex, texCoordXpY0)[SNOW];
-            totalNeighborSoilMoisture += texture(waterTex, texCoordXpY0)[SOIL_MOISTURE];
+            totalNeighborSnow += waterXpY0[SNOW];
+            totalNeighborSoilMoisture += waterXpY0[SOIL_MOISTURE];
             numNeighbors += 1.;
           }
           if (numNeighbors > 0.) { // prevent devide by 0
@@ -465,8 +620,8 @@ void main()
           int subInterval = int(iterNum) / 100;
 
           if (subInterval % (int(water[SOIL_MOISTURE] * 0.1 + water[SNOW] * 0.5) + 10) == 0 && wall[VEGETATION] >= minimalFireVegetation &&
-              (wallXmY0[TYPE] == WALLTYPE_FIRE || wallXpY0[TYPE] == WALLTYPE_FIRE || texture(waterTex, texCoordX0Yp)[SMOKE] > 4.5)) { // if left or right is on fire or fire is blowing over
-            wall[TYPE] = WALLTYPE_FIRE;                                                                                               // spread fire
+              (wallXmY0[TYPE] == WALLTYPE_FIRE || wallXpY0[TYPE] == WALLTYPE_FIRE || waterX0Yp[SMOKE] > 4.5)) { // if left or right is on fire or fire is blowing over
+            wall[TYPE] = WALLTYPE_FIRE;                                                                        // spread fire
           }
           //}
         }
@@ -520,7 +675,6 @@ void main()
         base[TEMPERATURE] = clamp(base[TEMPERATURE], CtoK(0.0), CtoK(maxWaterTemp)); // limit water temperature range
 
         wall[VEGETATION] = 20;
-        water[SOIL_MOISTURE] = 100.0;
         water[SNOW] = 0.0;
         break;
       }

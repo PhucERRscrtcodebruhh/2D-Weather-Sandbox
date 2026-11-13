@@ -350,7 +350,11 @@ void main()
       color = getWallColor(depth);
 
       break;
+
+      
     case WALLTYPE_WATER:
+
+      const float MIN_MASS = 0.005;
 
       // Precomputed values (tweak to taste)
       // Frequencies
@@ -375,28 +379,70 @@ void main()
       vec4 baseX0Yp = texture(baseTex, texCoordX0Yp);
       float windSpeed = baseX0Yp[VX] * 10.;
 
-      // combine based on wind direction
-      float waterLevel = 0.8 + waveSignalL * max(-windSpeed, 0.) + waveSignalR * max(windSpeed, 0.);
-
-      if (wall[VERT_DISTANCE] == 0 && fract(fragCoord.y) > waterLevel) { // air
-        vec4 airColor = getAirColor(fragCoord + vec2(0., 0.5));
-
-        opacity = airColor.a;
-        color = airColor.rgb;
-      } else {
-        color = vec3(0, 0.5, 1.0); // water
+      vec4 exactWater = texture(waterTex, bndFragCoord * texelSize);
+      float waterMass = exactWater[SOIL_MOISTURE];
+      if (waterMass > 20.0 || (waterMass <= 0.0 && exactWater[TOTAL] < 1000.0)) {
+        waterMass = 1.0;
       }
 
-      // draw 45° slopes under water
+      ivec4 wallX0Yp = texture(wallTex, texCoordX0Yp);
+      bool submerged = (wallX0Yp[DISTANCE] == 0 && wallX0Yp[TYPE] == WALLTYPE_WATER);
 
       float localX = fract(fragCoord.x);
       float localY = fract(fragCoord.y);
+      int savedVertDist = wall[VERT_DISTANCE];
+
+      const vec3 waterCol = vec3(0.0, 0.5, 1.0);
+
+      if (submerged) {
+        color = waterCol;
+        opacity = 1.0;
+      } else if (waterMass < MIN_MASS) {
+        // Dưới ngưỡng MIN_MASS: chỉ ẩn ở bước render (vẽ như không khí), không xóa dữ liệu vật lý
+        vec4 airColor = getAirColor(fragCoord);
+        float airAlpha = clamp(airColor.a, 0.0, 1.0);
+        color = (airAlpha > 0.0001) ? airColor.rgb : vec3(0.0);
+        opacity = airAlpha;
+      } else {
+        float fill = clamp(waterMass, 0.0, 1.0);
+        float waveAmp = clamp(fill * 2.0, 0.0, 1.0);
+        float waterLevel = clamp(fill + (waveSignalL * max(-windSpeed, 0.) + waveSignalR * max(windSpeed, 0.)) * waveAmp, 0.0, 1.0);
+
+        float cellPixelHeight = fwidth(fragCoord.y);
+        float waterCoverage;
+
+        if (cellPixelHeight < 0.8) {
+          float aa = max(cellPixelHeight * 0.5, 0.001);
+          waterCoverage = 1.0 - smoothstep(waterLevel - aa, waterLevel + aa, localY);
+        } else {
+          waterCoverage = waterLevel;
+        }
+
+        if (waterCoverage >= 0.999) {
+          color = waterCol;
+          opacity = 1.0;
+        } else {
+          vec4 airColor = getAirColor(fragCoord + vec2(0., 0.5));
+          float airAlpha = clamp(airColor.a, 0.0, 1.0);
+          vec3 safeAirRgb = (airAlpha > 0.0001) ? airColor.rgb : vec3(0.0);
+
+          float outAlpha = mix(airAlpha, 1.0, waterCoverage);
+          if (outAlpha > 0.0001) {
+            color = (safeAirRgb * airAlpha * (1.0 - waterCoverage) + waterCol * waterCoverage) / outAlpha;
+          } else {
+            color = vec3(0.0);
+          }
+          opacity = outAlpha;
+        }
+      }
+
+      // draw 45° slopes under water
 
       if (wallXmY0[DISTANCE] == 0 && wallXmY0[TYPE] != WALLTYPE_WATER && (fragCoord.y < 1. || wallX0Ym[TYPE] != WALLTYPE_WATER)) { // wall to the left and below
         if (localX + localY < 1.0) {
           opacity = 1.0;
           water = texture(waterTex, texCoord);
-          color = getWallColor(float(-wall[VERT_DISTANCE]) - localY);
+          color = getWallColor(float(-savedVertDist) - localY);
           shadowLight = minShadowLight;
         }
       }
@@ -404,7 +450,7 @@ void main()
         if (localY - localX < 0.0) {
           opacity = 1.0;
           water = texture(waterTex, texCoord);
-          color = getWallColor(float(-wall[VERT_DISTANCE]) - localY);
+          color = getWallColor(float(-savedVertDist) - localY);
           shadowLight = minShadowLight;
         }
       }
